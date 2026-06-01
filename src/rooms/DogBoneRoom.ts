@@ -12,6 +12,7 @@ type MoveDogMessage = {
   rowChange?: number;
   colChange?: number;
   distance?: number;
+  moveId?: number;
 };
 
 type PowerType =
@@ -498,12 +499,15 @@ export class DogBoneRoom extends Room<LobbyState> {
     const player = this.state.players.get(client.sessionId);
     if (!player) return;
 
+    const numericMoveId = Number(message?.moveId);
+    const moveId = Number.isInteger(numericMoveId) ? numericMoveId : undefined;
+
     // Only the randomly selected runners are allowed to move.
     // Spectators stay in the room for future buffs/debuffs, but cannot move dogs.
     if (!player.isRunner) return;
 
     if (this.isPlayerFrozen(player)) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
@@ -513,17 +517,17 @@ export class DogBoneRoom extends Room<LobbyState> {
     // Only allow one-cell orthogonal movement commands.
     // Speed boost is applied server-side after this validation.
     if (!Number.isInteger(rowChange)) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
     if (!Number.isInteger(colChange)) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
     if (Math.abs(rowChange) + Math.abs(colChange) !== 1) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
@@ -538,7 +542,7 @@ export class DogBoneRoom extends Room<LobbyState> {
       // Glue blocks every first attempt, then allows the next one.
       if (player.glueMoveAttemptCount % 2 === 1) {
         this.state.roundMessage = `${player.name} is stuck in glue!`;
-        this.sendMoveResult(client, false, player);
+        this.sendMoveResult(client, false, player, moveId);
         return;
       }
     }
@@ -547,12 +551,12 @@ export class DogBoneRoom extends Room<LobbyState> {
     const requestedDistance = Number(message?.distance ?? 1);
 
     if (!Number.isInteger(requestedDistance)) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
     if (requestedDistance < 1 || requestedDistance > 2) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
@@ -570,7 +574,7 @@ export class DogBoneRoom extends Room<LobbyState> {
     // Clients can be laggy, stale, or modified, so the server must be the final
     // authority on whether a runner can cross a wall.
     if (moveDistance <= 0) {
-      this.sendMoveResult(client, false, player);
+      this.sendMoveResult(client, false, player, moveId);
       return;
     }
 
@@ -582,7 +586,7 @@ export class DogBoneRoom extends Room<LobbyState> {
           colChange,
         )
       ) {
-        this.sendMoveResult(client, false, player);
+        this.sendMoveResult(client, false, player, moveId);
         return;
       }
 
@@ -593,19 +597,25 @@ export class DogBoneRoom extends Room<LobbyState> {
 
       // A score can end the round during a speed-boosted two-cell move.
       if (this.state.roundPhase !== "playing") {
-        this.sendMoveResult(client, true, player);
+        this.sendMoveResult(client, true, player, moveId);
         return;
       }
     }
 
-    this.sendMoveResult(client, true, player);
+    this.sendMoveResult(client, true, player, moveId);
   }
 
-  private sendMoveResult(client: Client, accepted: boolean, player: Player) {
+  private sendMoveResult(
+    client: Client,
+    accepted: boolean,
+    player: Player,
+    moveId?: number,
+  ) {
     client.send("move_result", {
       accepted,
       row: player.row,
       col: player.col,
+      moveId,
     });
   }
 
