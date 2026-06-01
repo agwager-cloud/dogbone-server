@@ -1,6 +1,7 @@
 import { Room, Client } from "colyseus";
 import { LobbyState, BoardPowerItem } from "./schema/LobbyState";
 import { Player } from "./schema/Player";
+import { generateMaze, MazeData } from "../game/MazeGenerator";
 
 type CellPoint = {
   row: number;
@@ -535,16 +536,24 @@ export class DogBoneRoom extends Room<LobbyState> {
 
     // Non-boosted players are clamped to 1 square, even if a modified client
     // tries to request a longer move.
-    const moveDistance = Math.min(requestedDistance, maxMoveDistance);
+    const requestedMoveDistance = Math.min(requestedDistance, maxMoveDistance);
+    const moveDistance = this.getAllowedMoveDistanceFromCell(
+      { row: player.row, col: player.col },
+      rowChange,
+      colChange,
+      requestedMoveDistance,
+    );
 
-    for (let step = 1; step <= moveDistance; step++) {
-      const nextRow = player.row + rowChange * step;
-      const nextCol = player.col + colChange * step;
-
-      if (!this.isInsideMaze(nextRow, nextCol)) return;
-    }
+    // Critical server-side maze collision check.
+    // Clients can be laggy, stale, or modified, so the server must be the final
+    // authority on whether a runner can cross a wall.
+    if (moveDistance <= 0) return;
 
     for (let step = 0; step < moveDistance; step++) {
+      if (!this.canMoveFromCell({ row: player.row, col: player.col }, rowChange, colChange)) {
+        return;
+      }
+
       player.row += rowChange;
       player.col += colChange;
 
@@ -870,6 +879,82 @@ export class DogBoneRoom extends Room<LobbyState> {
 
   private isInsideMaze(row: number, col: number) {
     return row >= 0 && row < MAZE_ROWS && col >= 0 && col < MAZE_COLS;
+  }
+
+  private createMazeForRound(roundNumber: number, matchNumber = this.state.matchNumber): MazeData {
+    const joinCode = String(this.state.joinCode ?? "00000");
+    const seed = this.createSeedFromText(
+      `${joinCode}-match-${matchNumber}-round-${roundNumber}`,
+    );
+
+    return generateMaze(MAZE_ROWS, MAZE_COLS, seed);
+  }
+
+  private createSeedFromText(text: string): number {
+    let seed = 0;
+
+    for (let i = 0; i < text.length; i++) {
+      seed = (seed * 31 + text.charCodeAt(i)) >>> 0;
+    }
+
+    return Math.max(1, seed);
+  }
+
+  private getCurrentMazeData(): MazeData {
+    return this.createMazeForRound(this.state.roundNumber, this.state.matchNumber);
+  }
+
+  private getMazeCell(row: number, col: number) {
+    if (!this.isInsideMaze(row, col)) return undefined;
+
+    const mazeData = this.getCurrentMazeData();
+    return mazeData.cells[row * mazeData.cols + col];
+  }
+
+  private canMoveFromCell(
+    cellPoint: CellPoint,
+    rowChange: number,
+    colChange: number,
+  ) {
+    const cell = this.getMazeCell(cellPoint.row, cellPoint.col);
+    if (!cell) return false;
+
+    const nextRow = cellPoint.row + rowChange;
+    const nextCol = cellPoint.col + colChange;
+
+    if (!this.isInsideMaze(nextRow, nextCol)) return false;
+
+    if (rowChange === -1) return !cell.walls.top;
+    if (rowChange === 1) return !cell.walls.bottom;
+    if (colChange === -1) return !cell.walls.left;
+    if (colChange === 1) return !cell.walls.right;
+
+    return false;
+  }
+
+  private getAllowedMoveDistanceFromCell(
+    startCell: CellPoint,
+    rowChange: number,
+    colChange: number,
+    maxDistance: number,
+  ) {
+    let currentCell = { ...startCell };
+    let allowedDistance = 0;
+
+    for (let step = 0; step < maxDistance; step++) {
+      if (!this.canMoveFromCell(currentCell, rowChange, colChange)) {
+        break;
+      }
+
+      currentCell = {
+        row: currentCell.row + rowChange,
+        col: currentCell.col + colChange,
+      };
+
+      allowedDistance += 1;
+    }
+
+    return allowedDistance;
   }
 
   private handleCastPower(client: Client, message: CastPowerMessage) {
