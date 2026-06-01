@@ -163,7 +163,7 @@ export class DogBoneRoom extends Room<LobbyState> {
     // Send state patches more frequently so touch movement feels more responsive.
     // This keeps the server authoritative but reduces the wait for clients to
     // receive the updated runner position after a move_dog message.
-    this.setPatchRate(20);
+    this.setPatchRate(16);
 
     this.setState(new LobbyState());
 
@@ -502,16 +502,30 @@ export class DogBoneRoom extends Room<LobbyState> {
     // Spectators stay in the room for future buffs/debuffs, but cannot move dogs.
     if (!player.isRunner) return;
 
-    if (this.isPlayerFrozen(player)) return;
+    if (this.isPlayerFrozen(player)) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
 
     let rowChange = Number(message?.rowChange ?? 0);
     let colChange = Number(message?.colChange ?? 0);
 
     // Only allow one-cell orthogonal movement commands.
     // Speed boost is applied server-side after this validation.
-    if (!Number.isInteger(rowChange)) return;
-    if (!Number.isInteger(colChange)) return;
-    if (Math.abs(rowChange) + Math.abs(colChange) !== 1) return;
+    if (!Number.isInteger(rowChange)) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
+
+    if (!Number.isInteger(colChange)) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
+
+    if (Math.abs(rowChange) + Math.abs(colChange) !== 1) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
 
     if (this.isPlayerControlsReversed(player)) {
       rowChange *= -1;
@@ -524,6 +538,7 @@ export class DogBoneRoom extends Room<LobbyState> {
       // Glue blocks every first attempt, then allows the next one.
       if (player.glueMoveAttemptCount % 2 === 1) {
         this.state.roundMessage = `${player.name} is stuck in glue!`;
+        this.sendMoveResult(client, false, player);
         return;
       }
     }
@@ -531,8 +546,15 @@ export class DogBoneRoom extends Room<LobbyState> {
     const maxMoveDistance = this.isPlayerSpeedBoosted(player) ? 2 : 1;
     const requestedDistance = Number(message?.distance ?? 1);
 
-    if (!Number.isInteger(requestedDistance)) return;
-    if (requestedDistance < 1 || requestedDistance > 2) return;
+    if (!Number.isInteger(requestedDistance)) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
+
+    if (requestedDistance < 1 || requestedDistance > 2) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
 
     // Non-boosted players are clamped to 1 square, even if a modified client
     // tries to request a longer move.
@@ -547,10 +569,20 @@ export class DogBoneRoom extends Room<LobbyState> {
     // Critical server-side maze collision check.
     // Clients can be laggy, stale, or modified, so the server must be the final
     // authority on whether a runner can cross a wall.
-    if (moveDistance <= 0) return;
+    if (moveDistance <= 0) {
+      this.sendMoveResult(client, false, player);
+      return;
+    }
 
     for (let step = 0; step < moveDistance; step++) {
-      if (!this.canMoveFromCell({ row: player.row, col: player.col }, rowChange, colChange)) {
+      if (
+        !this.canMoveFromCell(
+          { row: player.row, col: player.col },
+          rowChange,
+          colChange,
+        )
+      ) {
+        this.sendMoveResult(client, false, player);
         return;
       }
 
@@ -560,8 +592,21 @@ export class DogBoneRoom extends Room<LobbyState> {
       this.handlePlayerArrived(player);
 
       // A score can end the round during a speed-boosted two-cell move.
-      if (this.state.roundPhase !== "playing") return;
+      if (this.state.roundPhase !== "playing") {
+        this.sendMoveResult(client, true, player);
+        return;
+      }
     }
+
+    this.sendMoveResult(client, true, player);
+  }
+
+  private sendMoveResult(client: Client, accepted: boolean, player: Player) {
+    client.send("move_result", {
+      accepted,
+      row: player.row,
+      col: player.col,
+    });
   }
 
   private handlePlayerArrived(player: Player) {
