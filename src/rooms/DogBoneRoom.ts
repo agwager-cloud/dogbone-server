@@ -46,6 +46,11 @@ type RemovePlayerMessage = {
   sessionId?: string;
 };
 
+type JoinOptions = {
+  name?: unknown;
+  clientId?: unknown;
+};
+
 const ROUND_SECONDS = 60;
 const ROUND_END_DELAY_MS = 1500;
 
@@ -110,6 +115,12 @@ export class DogBoneRoom extends Room<LobbyState> {
   private static usedJoinCodes = new Set<string>();
   public static joinCodeToRoomId = new Map<string, string>();
 
+  // A stable clientId is sent from browser localStorage. This prevents one
+  // physical device/browser from being added to the same room multiple times
+  // when a student double-taps Join, refreshes, or reconnects.
+  private activeSessionIdByClientId = new Map<string, string>();
+  private clientIdBySessionId = new Map<string, string>();
+
   private static generateJoinCode(): string {
     let code = "";
 
@@ -137,6 +148,86 @@ export class DogBoneRoom extends Room<LobbyState> {
       .slice(0, MAX_PLAYER_NAME_LENGTH)
       .join("")
       .trim();
+  }
+
+  private normalizeClientId(value: unknown, fallback: string) {
+    const rawId = typeof value === "string" ? value.trim() : "";
+    const cleanId = rawId.replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 96);
+
+    if (cleanId.length >= 8) {
+      return cleanId;
+    }
+
+    return fallback;
+  }
+
+  private reconnectExistingClientSession(
+    client: Client,
+    clientId: string,
+    fallbackName: string,
+  ) {
+    const existingSessionId = this.activeSessionIdByClientId.get(clientId);
+
+    if (!existingSessionId || existingSessionId === client.sessionId) {
+      return undefined;
+    }
+
+    const existingPlayer = this.state.players.get(existingSessionId);
+    const wasHost = this.state.hostId === existingSessionId;
+    const wasBoneCarrier =
+      this.state.boneCarrierSessionId === existingSessionId;
+
+    this.clientIdBySessionId.delete(existingSessionId);
+
+    if (!existingPlayer) {
+      this.activeSessionIdByClientId.set(clientId, client.sessionId);
+      this.clientIdBySessionId.set(client.sessionId, clientId);
+      return undefined;
+    }
+
+    // Move the same logical player to the new Colyseus session id instead of
+    // adding a second copy with the same name. This preserves their team and,
+    // if they reconnect mid-round, their runner position.
+    this.state.players.delete(existingSessionId);
+
+    existingPlayer.sessionId = client.sessionId;
+    existingPlayer.name = this.normalizePlayerName(
+      fallbackName,
+      existingPlayer.name || `Player ${this.clients.length}`,
+    );
+
+    if (wasHost) {
+      this.state.hostId = client.sessionId;
+      existingPlayer.isHost = true;
+    }
+
+    if (wasBoneCarrier) {
+      this.state.boneCarrierSessionId = client.sessionId;
+    }
+
+    this.state.players.set(client.sessionId, existingPlayer);
+
+    this.activeSessionIdByClientId.set(clientId, client.sessionId);
+    this.clientIdBySessionId.set(client.sessionId, clientId);
+
+    const oldClient = this.clients.find(
+      (roomClient) => roomClient.sessionId === existingSessionId,
+    );
+
+    oldClient?.send("duplicate_connection", {
+      reason:
+        "This player has reconnected in another tab or by tapping Join again.",
+    });
+
+    this.clock.setTimeout(() => {
+      (oldClient as any)?.leave?.(4001, "Duplicate connection replaced.");
+    }, 80);
+
+    console.log(
+      `Replaced duplicate clientId ${clientId}: ${existingSessionId} -> ${client.sessionId}`,
+    );
+
+    return existingPlayer;
   }
 
   private getRandomBalancedTeamId(): number {
@@ -251,8 +342,34 @@ export class DogBoneRoom extends Room<LobbyState> {
     });
   }
 
-  onJoin(client: Client, options: any) {
+  onJoin(client: Client, options: JoinOptions) {
     console.log(`Client joined: ${client.sessionId}`, options);
+
+    const clientId = this.normalizeClientId(
+      options?.clientId,
+      client.sessionId,
+    );
+    const submittedName = typeof options?.name === "string" ? options.name : "";
+
+    const reconnectedPlayer = this.reconnectExistingClientSession(
+      client,
+      clientId,
+      submittedName,
+    );
+
+    if (reconnectedPlayer) {
+      console.log(
+        `Player reconnected without duplicate: ${reconnectedPlayer.name} (${client.sessionId}) host=${reconnectedPlayer.isHost} team=${reconnectedPlayer.teamId} runner=${reconnectedPlayer.isRunner}`,
+      );
+
+      if (this.state.matchEnded) {
+        client.send("match_end");
+      } else if (this.state.gameStarted) {
+        client.send("start_game");
+      }
+
+      return;
+    }
 
     const player = new Player();
 
@@ -279,9 +396,11 @@ export class DogBoneRoom extends Room<LobbyState> {
     this.placePlayerAtTeamStart(player);
 
     this.state.players.set(client.sessionId, player);
+    this.activeSessionIdByClientId.set(clientId, client.sessionId);
+    this.clientIdBySessionId.set(client.sessionId, clientId);
 
     console.log(
-      `Player added: ${player.name} (${client.sessionId}) host=${player.isHost} team=${player.teamId} runner=${player.isRunner} row=${player.row} col=${player.col}`,
+      `Player added: ${player.name} (${client.sessionId}) clientId=${clientId} host=${player.isHost} team=${player.teamId} runner=${player.isRunner} row=${player.row} col=${player.col}`,
     );
 
     if (this.state.matchEnded) {
@@ -293,6 +412,16 @@ export class DogBoneRoom extends Room<LobbyState> {
 
   onLeave(client: Client, consented: boolean) {
     console.log(`Client left: ${client.sessionId} consented=${consented}`);
+
+    const clientId = this.clientIdBySessionId.get(client.sessionId);
+    this.clientIdBySessionId.delete(client.sessionId);
+
+    if (
+      clientId &&
+      this.activeSessionIdByClientId.get(clientId) === client.sessionId
+    ) {
+      this.activeSessionIdByClientId.delete(clientId);
+    }
 
     const wasHost = this.state.hostId === client.sessionId;
     const wasBoneCarrier = this.state.boneCarrierSessionId === client.sessionId;
@@ -936,7 +1065,10 @@ export class DogBoneRoom extends Room<LobbyState> {
     return row >= 0 && row < MAZE_ROWS && col >= 0 && col < MAZE_COLS;
   }
 
-  private createMazeForRound(roundNumber: number, matchNumber = this.state.matchNumber): MazeData {
+  private createMazeForRound(
+    roundNumber: number,
+    matchNumber = this.state.matchNumber,
+  ): MazeData {
     const joinCode = String(this.state.joinCode ?? "00000");
     const seed = this.createSeedFromText(
       `${joinCode}-match-${matchNumber}-round-${roundNumber}`,
@@ -956,7 +1088,10 @@ export class DogBoneRoom extends Room<LobbyState> {
   }
 
   private getCurrentMazeData(): MazeData {
-    return this.createMazeForRound(this.state.roundNumber, this.state.matchNumber);
+    return this.createMazeForRound(
+      this.state.roundNumber,
+      this.state.matchNumber,
+    );
   }
 
   private getMazeCell(row: number, col: number) {
